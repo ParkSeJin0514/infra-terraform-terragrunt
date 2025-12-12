@@ -187,3 +187,5 @@ GitHub Actions → Run workflow → confirm: "destroy" 입력
 |--------|------|
 | **platform-gitops** | GitOps 매니페스트 (Karpenter, ArgoCD Apps) |
 | **petclinic-gitops** | PetClinic 애플리케이션 GitOps |
+
+### test
