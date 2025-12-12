@@ -120,14 +120,20 @@ resource "aws_iam_policy" "karpenter_controller" {
         ]
         Resource = aws_sqs_queue.karpenter_interruption.arn
       },
-      # IAM Instance Profile 조회
+      # IAM Instance Profile 관리 (Karpenter 1.0+ 필수)
+      # Karpenter가 자체적으로 Instance Profile 생성/관리
       {
-        Sid    = "IAMInstanceProfile"
+        Sid    = "IAMInstanceProfileManagement"
         Effect = "Allow"
         Action = [
-          "iam:GetInstanceProfile"
+          "iam:AddRoleToInstanceProfile",
+          "iam:CreateInstanceProfile",
+          "iam:DeleteInstanceProfile",
+          "iam:GetInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+          "iam:TagInstanceProfile"
         ]
-        Resource = aws_iam_instance_profile.karpenter_node.arn
+        Resource = "*"
       }
     ]
   })
