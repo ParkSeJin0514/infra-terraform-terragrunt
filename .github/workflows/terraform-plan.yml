@@ -1,0 +1,155 @@
+# ============================================================================
+# Terraform Plan (PR 생성/업데이트 시 실행)
+# ============================================================================
+# PR에 Plan 결과를 코멘트로 남깁니다.
+# ============================================================================
+
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.hcl'
+      - 'modules/**'
+      - '.github/workflows/terraform-*.yml'
+
+env:
+  AWS_REGION: ap-northeast-2
+  TF_VERSION: 1.9.0
+  TG_VERSION: 0.54.0
+
+# PR당 하나의 워크플로우만 실행 (이전 실행 취소)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    
+    # OIDC 토큰 발급 권한
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    
+    steps:
+      # ========================================
+      # 1. 체크아웃
+      # ========================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ========================================
+      # 2. AWS 인증 (OIDC)
+      # ========================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ========================================
+      # 3. Terraform 설치
+      # ========================================
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ========================================
+      # 4. Terragrunt 설치
+      # ========================================
+      - name: Setup Terragrunt
+        run: |
+          wget -q https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt_linux_amd64
+          sudo mv terragrunt_linux_amd64 /usr/local/bin/terragrunt
+          terragrunt --version
+
+      # ========================================
+      # 5. Terragrunt Plan
+      # ========================================
+      - name: Terragrunt Plan
+        id: plan
+        env:
+          TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
+        run: |
+          echo "=== Foundation ===" > plan_output.txt
+          cd foundation && terragrunt plan -no-color 2>&1 | tee -a ../plan_output.txt
+          echo "=== Compute ===" >> ../plan_output.txt
+          cd ../compute && terragrunt plan -no-color 2>&1 | tee -a ../plan_output.txt
+          echo "=== Bootstrap ===" >> ../plan_output.txt
+          cd ../bootstrap && terragrunt plan -no-color 2>&1 | tee -a ../plan_output.txt
+          cd ..
+          
+          # Plan 결과 저장 (GitHub Actions output 크기 제한 대응)
+          echo 'plan_output<<EOF' >> $GITHUB_OUTPUT
+          tail -c 60000 plan_output.txt >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      # ========================================
+      # 6. PR에 코멘트
+      # ========================================
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `## 🏗️ Terraform Plan 결과
+
+            #### Plan: \`${{ steps.plan.outcome }}\`
+
+            <details>
+            <summary>📋 Plan 상세 보기</summary>
+
+            \`\`\`hcl
+            ${{ steps.plan.outputs.plan_output }}
+            \`\`\`
+
+            </details>
+
+            ---
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*
+            *Workflow: \`${{ github.workflow }}\`*`;
+
+            // 기존 코멘트 찾기
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('Terraform Plan 결과')
+            );
+
+            // 기존 코멘트 업데이트 또는 새로 생성
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: output
+              });
+            }
+
+      # ========================================
+      # 7. Plan 실패 시 워크플로우 실패 처리
+      # ========================================
+      - name: Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
