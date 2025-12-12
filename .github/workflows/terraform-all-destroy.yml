@@ -2,21 +2,9 @@
 # .github/workflows/terraform-all-destroy.yml
 # ============================================================================
 # Terraform/Terragrunt 인프라 삭제 워크플로우
-# - EKS 리소스 사전 정리 (ArgoCD, Karpenter, Ingress, CRD 등)
-# - ALB 명시적 삭제 (argocd-alb, petclinic 관련)
+# - Karpenter 완전 강제 삭제 (Controller, NodeClaim, NodePool, EC2NodeClass, CRD)
+# - AWS CLI로 직접 리소스 삭제 (EKS, RDS, EC2, NAT, ENI 등)
 # - Terragrunt destroy 실행
-#
-# 개선사항:
-# - Karpenter 리소스 정리 로직 추가 (NodeClaim, NodePool, EC2NodeClass)
-# - Karpenter가 프로비저닝한 EC2 인스턴스 종료
-# - CRD Finalizer 제거 로직 추가
-# - Terraform 버전 1.9.0 업그레이드
-# - -refresh=false 옵션 추가 (state 꼬임 방지)
-# - TERRAGRUNT_IGNORE_DEPENDENCY_ERRORS 추가
-# - 백그라운드 삭제로 타임아웃 방지
-# - ALB 명시적 삭제 로직 추가 (argocd-alb 등)
-# - for 루프 기반 명시적 finalizer 제거 추가
-# - ArgoCD 전체 컴포넌트 중지 로직 추가 (finalizer 재추가 방지)
 # ============================================================================
 
 name: 'Terraform Destroy'
@@ -44,6 +32,7 @@ env:
   TF_VERSION: '1.9.0'
   TG_VERSION: '0.54.0'
   TERRAGRUNT_IGNORE_DEPENDENCY_ERRORS: "true"
+  PROJECT_NAME: "petclinic-kr"
 
 permissions:
   id-token: write
@@ -67,12 +56,14 @@ jobs:
         run: echo "✅ 삭제가 확인되었습니다."
 
   # ============================================================================
-  # EKS 리소스 사전 정리
+  # EKS 리소스 사전 정리 (Kubernetes 리소스)
   # ============================================================================
   pre-cleanup:
     name: 'Pre-Cleanup EKS Resources'
     needs: confirm
     runs-on: ubuntu-latest
+    outputs:
+      vpc_id: ${{ steps.get-vpc.outputs.vpc_id }}
     steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -82,12 +73,19 @@ jobs:
 
       - name: Install tools
         run: |
-          # kubectl 설치
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl
           sudo mv kubectl /usr/local/bin/
-          # jq 설치 (finalizer 제거용)
           sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Get VPC ID
+        id: get-vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=*${{ env.PROJECT_NAME }}*" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "VPC ID: $VPC_ID"
 
       - name: Check EKS Cluster
         id: check-eks
@@ -108,120 +106,316 @@ jobs:
           aws eks update-kubeconfig --name ${{ steps.check-eks.outputs.cluster_name }} --region ${{ env.AWS_REGION }}
 
       # ========================================================================
-      # ArgoCD 컴포넌트 중지 (가장 먼저 실행)
+      # 1단계: Karpenter 완전 강제 삭제 (가장 먼저!)
+      # ========================================================================
+      - name: Force Delete Karpenter - Step 1 - Stop Controller
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 1단계: Karpenter Controller 완전 중지 ==="
+          echo "=============================================="
+          
+          # Deployment 스케일 다운
+          kubectl scale deploy karpenter -n kube-system --replicas=0 2>/dev/null || true
+          
+          # Deployment 자체 삭제
+          kubectl delete deploy karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
+          
+          # 모든 Karpenter Pod 강제 삭제
+          kubectl delete pods -l app.kubernetes.io/name=karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
+          
+          # ServiceAccount 삭제 (재생성 방지)
+          kubectl delete sa karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
+          
+          echo "=== Controller 중지 대기 (15초) ==="
+          sleep 15
+          
+          # 확인
+          echo "=== Karpenter Pod 상태 확인 ==="
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter 2>/dev/null || echo "No Karpenter pods found"
+          
+          echo "✅ Karpenter Controller 중지 완료"
+
+      - name: Force Delete Karpenter - Step 2 - Delete NodeClaims
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 2단계: NodeClaim 강제 삭제 ==="
+          echo "=============================================="
+          
+          # 모든 NodeClaim 조회
+          NODECLAIMS=$(kubectl get nodeclaims -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$NODECLAIMS" ]; then
+            for NC in $NODECLAIMS; do
+              echo "Processing NodeClaim: $NC"
+              
+              # Finalizer 강제 제거 (JSON patch)
+              kubectl patch nodeclaim $NC --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              
+              # Merge patch로도 시도
+              kubectl patch nodeclaim $NC --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 삭제
+              kubectl delete nodeclaim $NC --force --grace-period=0 2>/dev/null || true
+            done
+          fi
+          
+          # 전체 삭제 한번 더
+          kubectl delete nodeclaims --all --force --grace-period=0 2>/dev/null || true
+          
+          echo "=== NodeClaim 삭제 대기 (10초) ==="
+          sleep 10
+          
+          # 확인
+          echo "=== NodeClaim 상태 확인 ==="
+          kubectl get nodeclaims 2>/dev/null || echo "No NodeClaims found"
+          
+          echo "✅ NodeClaim 삭제 완료"
+
+      - name: Force Delete Karpenter - Step 3 - Delete NodePools
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 3단계: NodePool 강제 삭제 ==="
+          echo "=============================================="
+          
+          # 모든 NodePool 조회
+          NODEPOOLS=$(kubectl get nodepools -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$NODEPOOLS" ]; then
+            for NP in $NODEPOOLS; do
+              echo "Processing NodePool: $NP"
+              
+              # Finalizer 강제 제거
+              kubectl patch nodepool $NP --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              
+              kubectl patch nodepool $NP --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 삭제
+              kubectl delete nodepool $NP --force --grace-period=0 2>/dev/null || true
+            done
+          fi
+          
+          # 전체 삭제
+          kubectl delete nodepools --all --force --grace-period=0 2>/dev/null || true
+          
+          echo "=== NodePool 삭제 대기 (5초) ==="
+          sleep 5
+          
+          echo "=== NodePool 상태 확인 ==="
+          kubectl get nodepools 2>/dev/null || echo "No NodePools found"
+          
+          echo "✅ NodePool 삭제 완료"
+
+      - name: Force Delete Karpenter - Step 4 - Delete EC2NodeClasses
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 4단계: EC2NodeClass 강제 삭제 ==="
+          echo "=============================================="
+          
+          # 모든 EC2NodeClass 조회
+          EC2NODECLASSES=$(kubectl get ec2nodeclasses -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$EC2NODECLASSES" ]; then
+            for EC2NC in $EC2NODECLASSES; do
+              echo "Processing EC2NodeClass: $EC2NC"
+              
+              # Finalizer 강제 제거
+              kubectl patch ec2nodeclass $EC2NC --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              
+              kubectl patch ec2nodeclass $EC2NC --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 삭제
+              kubectl delete ec2nodeclass $EC2NC --force --grace-period=0 2>/dev/null || true
+            done
+          fi
+          
+          # 전체 삭제
+          kubectl delete ec2nodeclasses --all --force --grace-period=0 2>/dev/null || true
+          
+          echo "=== EC2NodeClass 삭제 대기 (5초) ==="
+          sleep 5
+          
+          echo "=== EC2NodeClass 상태 확인 ==="
+          kubectl get ec2nodeclasses 2>/dev/null || echo "No EC2NodeClasses found"
+          
+          echo "✅ EC2NodeClass 삭제 완료"
+
+      - name: Force Delete Karpenter - Step 5 - Delete CRDs
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 5단계: Karpenter CRD 강제 삭제 ==="
+          echo "=============================================="
+          
+          KARPENTER_CRDS="nodeclaims.karpenter.sh nodepools.karpenter.sh ec2nodeclasses.karpenter.k8s.aws"
+          
+          for CRD in $KARPENTER_CRDS; do
+            if kubectl get crd $CRD > /dev/null 2>&1; then
+              echo "Processing CRD: $CRD"
+              
+              # CRD Finalizer 제거
+              kubectl patch crd $CRD --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              
+              kubectl patch crd $CRD --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 백그라운드로 삭제
+              kubectl delete crd $CRD --force --grace-period=0 &
+            fi
+          done
+          
+          echo "=== CRD 삭제 대기 (10초) ==="
+          sleep 10
+          
+          echo "=== Karpenter CRD 상태 확인 ==="
+          kubectl get crd | grep karpenter 2>/dev/null || echo "No Karpenter CRDs found"
+          
+          echo "✅ Karpenter CRD 삭제 완료"
+
+      - name: Force Delete Karpenter - Step 6 - Terminate EC2 Instances
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 6단계: Karpenter EC2 인스턴스 강제 종료 ==="
+          echo "=============================================="
+          
+          # 방법 1: karpenter.sh/nodepool 태그로 찾기
+          echo "=== 태그 기반 검색 ==="
+          KARPENTER_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          # 방법 2: node-type=karpenter 태그로도 찾기
+          KARPENTER_INSTANCES2=$(aws ec2 describe-instances \
+            --filters "Name=tag:node-type,Values=karpenter" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          # 방법 3: karpenter.sh/managed-by 태그로도 찾기
+          KARPENTER_INSTANCES3=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/managed-by" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          # 모든 인스턴스 합치기
+          ALL_INSTANCES="$KARPENTER_INSTANCES $KARPENTER_INSTANCES2 $KARPENTER_INSTANCES3"
+          UNIQUE_INSTANCES=$(echo $ALL_INSTANCES | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          
+          if [ -n "$UNIQUE_INSTANCES" ] && [ "$UNIQUE_INSTANCES" != " " ]; then
+            echo "Terminating Karpenter instances: $UNIQUE_INSTANCES"
+            aws ec2 terminate-instances --instance-ids $UNIQUE_INSTANCES 2>/dev/null || true
+            
+            echo "=== EC2 인스턴스 종료 대기 (60초) ==="
+            sleep 60
+          else
+            echo "ℹ️ Karpenter 인스턴스 없음"
+          fi
+          
+          echo "✅ Karpenter EC2 인스턴스 종료 완료"
+
+      - name: Karpenter Cleanup Summary
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== Karpenter 정리 최종 확인 ==="
+          echo "=============================================="
+          echo ""
+          echo "NodeClaims:"
+          kubectl get nodeclaims 2>/dev/null || echo "  None"
+          echo ""
+          echo "NodePools:"
+          kubectl get nodepools 2>/dev/null || echo "  None"
+          echo ""
+          echo "EC2NodeClasses:"
+          kubectl get ec2nodeclasses 2>/dev/null || echo "  None"
+          echo ""
+          echo "Karpenter CRDs:"
+          kubectl get crd | grep karpenter 2>/dev/null || echo "  None"
+          echo ""
+          echo "✅ Karpenter 강제 삭제 완료!"
+
+      # ========================================================================
+      # 2단계: ArgoCD 정리
       # ========================================================================
       - name: Stop ArgoCD Components
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
-          echo "=== ArgoCD 전체 컴포넌트 중지 (finalizer 재추가 방지) ==="
-          
-          # 모든 ArgoCD Deployment 중지
+          echo "=== ArgoCD 전체 컴포넌트 중지 ==="
           kubectl scale deploy --all -n argocd --replicas=0 2>/dev/null || true
-          
-          # 모든 ArgoCD StatefulSet 중지
           kubectl scale statefulset --all -n argocd --replicas=0 2>/dev/null || true
-          
-          # 개별 컴포넌트 명시적 중지 (백업)
-          kubectl scale deploy argocd-application-controller -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale deploy argocd-server -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale deploy argocd-repo-server -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale deploy argocd-dex-server -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale deploy argocd-redis -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale deploy argocd-notifications-controller -n argocd --replicas=0 2>/dev/null || true
-          kubectl scale statefulset argocd-application-controller -n argocd --replicas=0 2>/dev/null || true
-          
-          echo "=== ArgoCD Pod 종료 대기 (10초) ==="
+          kubectl delete deploy --all -n argocd --force --grace-period=0 2>/dev/null || true
           sleep 10
-          
-          # Pod 강제 삭제
           kubectl delete pods --all -n argocd --force --grace-period=0 2>/dev/null || true
-          
           echo "✅ ArgoCD 컴포넌트 중지 완료"
 
-      # ========================================================================
-      # ArgoCD 정리 (Finalizer 제거 포함)
-      # ========================================================================
-      - name: Cleanup ArgoCD Applications (Batch Finalizer Removal)
+      - name: Cleanup ArgoCD Applications
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
-          echo "=== ArgoCD Application Finalizer 일괄 제거 ==="
-          
-          # 방법 1: for 루프로 명시적 처리 (특정 앱 대상) - Karpenter 추가
-          for app in alb-controller argocd-ingress efs-csi-driver external-secrets petclinic root-app karpenter karpenter-config; do
-            kubectl patch application $app -n argocd -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          echo "=== ArgoCD Application Finalizer 제거 ==="
+          for app in $(kubectl get applications -n argocd -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            kubectl patch application $app -n argocd --type=json \
+              -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+            kubectl patch application $app -n argocd --type=merge \
+              -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
           done
-          
-          # 방법 2: 동적으로 남은 앱 처리
-          for app in $(kubectl get applications -n argocd -o name 2>/dev/null); do
-            kubectl patch $app -n argocd -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          
-          # 삭제
           kubectl delete applications.argoproj.io --all -n argocd --force --grace-period=0 2>/dev/null || true
           
-          # 삭제 확인
-          echo "=== Application 삭제 확인 ==="
-          kubectl get applications -n argocd 2>/dev/null || echo "No applications found"
-          
-          echo "=== ArgoCD ApplicationSet Finalizer 일괄 제거 ==="
-          for appset in $(kubectl get applicationsets -n argocd -o name 2>/dev/null); do
-            kubectl patch $appset -n argocd -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          for appset in $(kubectl get applicationsets -n argocd -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            kubectl patch applicationset $appset -n argocd --type=merge \
+              -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
           done
           kubectl delete applicationsets.argoproj.io --all -n argocd --force --grace-period=0 2>/dev/null || true
           
-          echo "=== ArgoCD AppProject Finalizer 일괄 제거 ==="
-          for proj in $(kubectl get appprojects -n argocd -o name 2>/dev/null); do
-            kubectl patch $proj -n argocd -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          for proj in $(kubectl get appprojects -n argocd -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            kubectl patch appproject $proj -n argocd --type=merge \
+              -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
           done
           kubectl delete appprojects.argoproj.io --all -n argocd --force --grace-period=0 2>/dev/null || true
           
-          echo "✅ ArgoCD 리소스 정리 완료"
-
-      - name: Delete ArgoCD CRDs with Finalizer removal
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        timeout-minutes: 3
-        run: |
-          echo "=== ArgoCD CRD Finalizer 제거 및 삭제 ==="
+          # ArgoCD CRD 삭제
           for CRD in applications.argoproj.io applicationsets.argoproj.io appprojects.argoproj.io; do
             if kubectl get crd $CRD > /dev/null 2>&1; then
-              echo "Processing CRD: $CRD"
-              kubectl patch crd $CRD -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+              kubectl patch crd $CRD --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
               kubectl delete crd $CRD --force --grace-period=0 &
             fi
           done
-          sleep 10
-          echo "CRD 삭제 요청 완료"
+          sleep 5
+          echo "✅ ArgoCD 정리 완료"
 
       # ========================================================================
-      # External Secrets 정리
+      # 3단계: External Secrets 정리
       # ========================================================================
-      - name: Cleanup External Secrets (Batch Finalizer Removal)
+      - name: Cleanup External Secrets
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
-          echo "=== External Secrets Controller 중지 ==="
+          echo "=== External Secrets 정리 ==="
           kubectl scale deploy --all -n external-secrets --replicas=0 2>/dev/null || true
+          kubectl delete deploy --all -n external-secrets --force --grace-period=0 2>/dev/null || true
           kubectl delete pods --all -n external-secrets --force --grace-period=0 2>/dev/null || true
-          sleep 5
           
-          echo "=== ClusterSecretStore Finalizer 일괄 제거 ==="
-          for css in $(kubectl get clustersecretstore -o name 2>/dev/null); do
-            kubectl patch $css -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          for css in $(kubectl get clustersecretstore -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            kubectl patch clustersecretstore $css --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
           done
           kubectl delete clustersecretstore --all --force --grace-period=0 2>/dev/null || true
+          kubectl delete externalsecret --all -A --force --grace-period=0 2>/dev/null || true
           
-          echo "=== SecretStore Finalizer 일괄 제거 (모든 네임스페이스) ==="
-          for ss in $(kubectl get secretstore -A -o name 2>/dev/null); do
-            kubectl patch $ss -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          kubectl delete secretstore --all -A --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== ExternalSecret 삭제 ==="
-          kubectl delete externalsecret --all -A --ignore-not-found=true 2>/dev/null || true
-          
-          echo "=== External Secrets CRD Finalizer 제거 및 삭제 ==="
-          for CRD in externalsecrets.external-secrets.io clustersecretstores.external-secrets.io secretstores.external-secrets.io clusterexternalsecrets.external-secrets.io; do
+          for CRD in externalsecrets.external-secrets.io clustersecretstores.external-secrets.io secretstores.external-secrets.io; do
             if kubectl get crd $CRD > /dev/null 2>&1; then
-              kubectl patch crd $CRD -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+              kubectl patch crd $CRD --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
               kubectl delete crd $CRD --force --grace-period=0 &
             fi
           done
@@ -229,221 +423,405 @@ jobs:
           echo "✅ External Secrets 정리 완료"
 
       # ========================================================================
-      # Karpenter 정리
+      # 4단계: Ingress 및 ALB 정리
       # ========================================================================
-      - name: Cleanup Karpenter Resources
+      - name: Delete All Ingresses
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
-          echo "=== Karpenter Controller 중지 ==="
-          kubectl scale deploy karpenter -n kube-system --replicas=0 2>/dev/null || true
-          kubectl delete pods -l app.kubernetes.io/name=karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
-          sleep 5
-          
-          echo "=== Karpenter NodeClaim 삭제 (프로비저닝된 노드 종료) ==="
-          # NodeClaim Finalizer 제거 후 삭제
-          for nc in $(kubectl get nodeclaims -o name 2>/dev/null); do
-            echo "Processing NodeClaim: $nc"
-            kubectl patch $nc -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          kubectl delete nodeclaims --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== Karpenter NodePool Finalizer 제거 및 삭제 ==="
-          for np in $(kubectl get nodepools -o name 2>/dev/null); do
-            echo "Processing NodePool: $np"
-            kubectl patch $np -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          kubectl delete nodepools --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== Karpenter EC2NodeClass Finalizer 제거 및 삭제 ==="
-          for ec2nc in $(kubectl get ec2nodeclasses -o name 2>/dev/null); do
-            echo "Processing EC2NodeClass: $ec2nc"
-            kubectl patch $ec2nc -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          kubectl delete ec2nodeclasses --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== Karpenter CRD Finalizer 제거 및 삭제 ==="
-          for CRD in nodepools.karpenter.sh nodeclaims.karpenter.sh ec2nodeclasses.karpenter.k8s.aws; do
-            if kubectl get crd $CRD > /dev/null 2>&1; then
-              echo "Processing CRD: $CRD"
-              kubectl patch crd $CRD -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-              kubectl delete crd $CRD --force --grace-period=0 &
-            fi
-          done
-          sleep 5
-          
-          echo "=== Karpenter가 프로비저닝한 EC2 인스턴스 정리 ==="
-          # karpenter.sh/nodepool 태그가 있는 인스턴스 종료
-          KARPENTER_INSTANCES=$(aws ec2 describe-instances \
-            --filters "Name=tag-key,Values=karpenter.sh/nodepool" "Name=instance-state-name,Values=running,pending" \
-            --query 'Reservations[*].Instances[*].InstanceId' \
-            --output text 2>/dev/null || true)
-          
-          if [ -n "$KARPENTER_INSTANCES" ]; then
-            echo "Terminating Karpenter instances: $KARPENTER_INSTANCES"
-            aws ec2 terminate-instances --instance-ids $KARPENTER_INSTANCES 2>/dev/null || true
-            echo "Waiting for instances to terminate..."
-            sleep 30
-          else
-            echo "No Karpenter instances found"
-          fi
-          
-          echo "✅ Karpenter 정리 완료"
-
-      # ========================================================================
-      # Ingress 및 ALB 정리
-      # ========================================================================
-      - name: Delete Ingresses (Batch Finalizer Removal)
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=== Ingress Finalizer 일괄 제거 (모든 네임스페이스) ==="
-          
-          # 방법 1: argocd-server ingress 명시적 처리
-          kubectl patch ingress argocd-server -n argocd -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          
-          # 방법 2: 동적으로 모든 ingress 처리
-          for ing in $(kubectl get ingress -A -o name 2>/dev/null); do
-            kubectl patch $ing -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
-          done
-          
-          echo "=== Ingress 삭제 (ALB 트리거) ==="
-          for NS in petclinic monitoring argocd external-secrets kube-system default; do
-            if kubectl get namespace $NS > /dev/null 2>&1; then
-              kubectl delete ingress --all -n $NS --force --grace-period=0 2>/dev/null || true
-            fi
-          done
+          echo "=== Ingress 삭제 ==="
+          kubectl delete ingress --all -A --force --grace-period=0 2>/dev/null || true
           echo "✅ Ingress 삭제 완료"
 
-      # ========================================================================
-      # ALB 명시적 삭제
-      # ========================================================================
-      - name: Delete ALBs Explicitly
-        if: steps.check-eks.outputs.cluster_exists == 'true'
+      - name: Delete ALBs and Target Groups
         run: |
-          echo "=== ALB 명시적 삭제 ==="
-          
-          ALB_NAMES=("argocd-alb" "petclinic-microservices-alb" "petclinic-monitoring-alb")
-          
-          for ALB_NAME in "${ALB_NAMES[@]}"; do
-            echo "Checking ALB: $ALB_NAME"
-            ALB_ARN=$(aws elbv2 describe-load-balancers --names "$ALB_NAME" \
-              --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "None")
-            
-            if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
-              echo "Deleting ALB: $ALB_NAME (ARN: $ALB_ARN)"
-              
-              LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
-                --query "Listeners[*].ListenerArn" --output text 2>/dev/null || true)
-              for LISTENER in $LISTENERS; do
-                echo "  Deleting Listener: $LISTENER"
-                aws elbv2 delete-listener --listener-arn "$LISTENER" 2>/dev/null || true
-              done
-              
-              aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" 2>/dev/null || true
-              echo "✅ Deleted: $ALB_NAME"
-            else
-              echo "ℹ️ ALB not found: $ALB_NAME"
-            fi
-          done
-          
-          echo ""
-          echo "=== ALB 삭제 대기 (60초) ==="
-          sleep 60
-
-      - name: Delete Target Groups
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=== Target Group 삭제 ==="
-          aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text 2>/dev/null | \
-          while IFS=$'\t' read -r TG_ARN TG_NAME; do
-            if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
-              if [[ "$TG_NAME" == *petclinic* ]] || [[ "$TG_NAME" == *argocd* ]] || [[ "$TG_NAME" == k8s-* ]] || [[ "$TG_NAME" == *monitoring* ]]; then
-                echo "Deleting TG: $TG_NAME"
-                aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null || true
-              fi
-            fi
-          done
-          echo "✅ Target Group 삭제 완료"
-
-      # ========================================================================
-      # Namespace 정리
-      # ========================================================================
-      - name: Cleanup Namespace Resources
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=== Namespace 리소스 삭제 ==="
-          for NS in petclinic monitoring argocd external-secrets; do
-            if kubectl get namespace $NS > /dev/null 2>&1; then
-              echo "Cleaning: $NS"
-              kubectl delete deploy --all -n $NS --force --grace-period=0 2>/dev/null || true
-              kubectl delete svc --all -n $NS --force --grace-period=0 2>/dev/null || true
-              kubectl delete statefulset --all -n $NS --force --grace-period=0 2>/dev/null || true
-              kubectl delete daemonset --all -n $NS --force --grace-period=0 2>/dev/null || true
-              kubectl delete job --all -n $NS --force --grace-period=0 2>/dev/null || true
-              kubectl delete configmap --all -n $NS --ignore-not-found=true 2>/dev/null || true
-              kubectl delete secret --all -n $NS --ignore-not-found=true 2>/dev/null || true
-              kubectl delete pvc --all -n $NS --ignore-not-found=true 2>/dev/null || true
-            fi
-          done
-
-      - name: Delete Namespaces with Finalizer removal
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=== Namespace Finalizer 일괄 제거 및 삭제 ==="
-          for NS in petclinic monitoring argocd external-secrets; do
-            if kubectl get namespace $NS > /dev/null 2>&1; then
-              echo "Deleting namespace: $NS"
-              
-              kubectl patch namespace $NS --type merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
-              kubectl delete namespace $NS --force --grace-period=0 --timeout=30s 2>/dev/null || true
-              
-              if kubectl get namespace $NS > /dev/null 2>&1; then
-                echo "Force deleting namespace: $NS"
-                kubectl get namespace $NS -o json 2>/dev/null | \
-                  jq '.spec.finalizers = []' | \
-                  kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
-              fi
-            fi
-          done
-
-      # ========================================================================
-      # AWS 리소스 직접 정리 (최종 확인)
-      # ========================================================================
-      - name: Cleanup Remaining AWS ALB/Target Groups
-        run: |
-          echo "=== 남은 ALB 최종 확인 및 삭제 ==="
+          echo "=== ALB 삭제 ==="
           aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerArn,LoadBalancerName]' --output text 2>/dev/null | \
           while IFS=$'\t' read -r ARN NAME; do
             if [ -n "$ARN" ] && [ "$ARN" != "None" ]; then
-              if [[ "$NAME" == *petclinic* ]] || [[ "$NAME" == *argocd* ]] || [[ "$NAME" == k8s-* ]] || [[ "$NAME" == *monitoring* ]]; then
-                echo "Deleting remaining ALB: $NAME"
+              if [[ "$NAME" == *petclinic* ]] || [[ "$NAME" == *argocd* ]] || [[ "$NAME" == k8s-* ]]; then
+                echo "Deleting ALB: $NAME"
+                LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ARN" --query 'Listeners[*].ListenerArn' --output text 2>/dev/null || true)
+                for L in $LISTENERS; do
+                  aws elbv2 delete-listener --listener-arn "$L" 2>/dev/null || true
+                done
                 aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" 2>/dev/null || true
               fi
             fi
           done
           
-          echo "=== 최종 대기 (30초) ==="
-          sleep 30
+          echo "=== ALB 삭제 대기 (60초) ==="
+          sleep 60
+          
+          echo "=== Target Group 삭제 ==="
+          aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text 2>/dev/null | \
+          while IFS=$'\t' read -r ARN NAME; do
+            if [ -n "$ARN" ] && [ "$ARN" != "None" ]; then
+              if [[ "$NAME" == *petclinic* ]] || [[ "$NAME" == *argocd* ]] || [[ "$NAME" == k8s-* ]]; then
+                echo "Deleting TG: $NAME"
+                aws elbv2 delete-target-group --target-group-arn "$ARN" 2>/dev/null || true
+              fi
+            fi
+          done
 
-      - name: Summary
+      # ========================================================================
+      # 5단계: Namespace 정리
+      # ========================================================================
+      - name: Cleanup Namespaces
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=== Namespace 정리 ==="
+          for NS in petclinic monitoring argocd external-secrets; do
+            if kubectl get namespace $NS > /dev/null 2>&1; then
+              kubectl delete all --all -n $NS --force --grace-period=0 2>/dev/null || true
+              kubectl patch namespace $NS --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              kubectl delete namespace $NS --force --grace-period=0 2>/dev/null || true
+              
+              # 강제 삭제
+              kubectl get namespace $NS -o json 2>/dev/null | \
+                jq '.spec.finalizers = []' | \
+                kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
+            fi
+          done
+
+      - name: Pre-Cleanup Summary
         run: |
           echo "✅ Pre-cleanup 완료!"
-          echo ""
-          echo "삭제된 항목:"
-          echo "  - ArgoCD Applications, ApplicationSets, AppProjects & CRDs (with finalizers)"
-          echo "  - External Secrets & CRDs (with finalizers)"
-          echo "  - Karpenter NodeClaims, NodePools, EC2NodeClasses & CRDs (with finalizers)"
-          echo "  - Karpenter가 프로비저닝한 EC2 인스턴스"
-          echo "  - Ingresses (with finalizers)"
-          echo "  - ALBs (argocd-alb, petclinic-microservices-alb, petclinic-monitoring-alb)"
-          echo "  - Target Groups (k8s-* 관련)"
-          echo "  - Namespaces (petclinic, monitoring, argocd, external-secrets)"
 
   # ============================================================================
-  # Terraform Destroy
+  # AWS 리소스 강제 삭제
+  # ============================================================================
+  aws-cleanup:
+    name: 'AWS Resources Cleanup'
+    needs: pre-cleanup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Get VPC ID
+        id: get-vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=*${{ env.PROJECT_NAME }}*" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "VPC ID: $VPC_ID"
+
+      # ========================================================================
+      # Karpenter EC2 인스턴스 한번 더 확인 및 종료
+      # ========================================================================
+      - name: Final Karpenter EC2 Cleanup
+        run: |
+          echo "=== Karpenter EC2 인스턴스 최종 정리 ==="
+          
+          KARPENTER_INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          if [ -n "$KARPENTER_INSTANCES" ] && [ "$KARPENTER_INSTANCES" != "None" ]; then
+            echo "Terminating remaining Karpenter instances: $KARPENTER_INSTANCES"
+            aws ec2 terminate-instances --instance-ids $KARPENTER_INSTANCES 2>/dev/null || true
+            sleep 30
+          else
+            echo "ℹ️ 남은 Karpenter 인스턴스 없음"
+          fi
+
+      # ========================================================================
+      # EKS Node Group 삭제
+      # ========================================================================
+      - name: Delete EKS Node Groups
+        run: |
+          echo "=== EKS Node Group 삭제 ==="
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-eks"
+          
+          NODE_GROUPS=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --query 'nodegroups[*]' --output text 2>/dev/null || true)
+          
+          for NG in $NODE_GROUPS; do
+            echo "Deleting Node Group: $NG"
+            aws eks delete-nodegroup --cluster-name $CLUSTER_NAME --nodegroup-name $NG 2>/dev/null || true
+          done
+          
+          if [ -n "$NODE_GROUPS" ] && [ "$NODE_GROUPS" != "None" ]; then
+            echo "=== Node Group 삭제 대기 (최대 10분) ==="
+            for i in {1..20}; do
+              REMAINING=$(aws eks list-nodegroups --cluster-name $CLUSTER_NAME --query 'nodegroups' --output text 2>/dev/null || echo "")
+              if [ -z "$REMAINING" ] || [ "$REMAINING" == "None" ]; then
+                echo "✅ 모든 Node Group 삭제 완료"
+                break
+              fi
+              echo "대기 중... ($i/20)"
+              sleep 30
+            done
+          fi
+
+      # ========================================================================
+      # EKS Cluster 삭제
+      # ========================================================================
+      - name: Delete EKS Cluster
+        run: |
+          echo "=== EKS Cluster 삭제 ==="
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-eks"
+          
+          if aws eks describe-cluster --name $CLUSTER_NAME > /dev/null 2>&1; then
+            echo "Deleting EKS Cluster: $CLUSTER_NAME"
+            aws eks delete-cluster --name $CLUSTER_NAME 2>/dev/null || true
+            
+            echo "=== EKS Cluster 삭제 대기 (최대 10분) ==="
+            for i in {1..20}; do
+              if ! aws eks describe-cluster --name $CLUSTER_NAME > /dev/null 2>&1; then
+                echo "✅ EKS Cluster 삭제 완료"
+                break
+              fi
+              echo "대기 중... ($i/20)"
+              sleep 30
+            done
+          else
+            echo "ℹ️ EKS Cluster 없음"
+          fi
+
+      # ========================================================================
+      # RDS 삭제
+      # ========================================================================
+      - name: Delete RDS Instance
+        run: |
+          echo "=== RDS 삭제 ==="
+          DB_INSTANCE="${{ env.PROJECT_NAME }}-db"
+          
+          if aws rds describe-db-instances --db-instance-identifier $DB_INSTANCE > /dev/null 2>&1; then
+            echo "Deleting RDS: $DB_INSTANCE"
+            aws rds delete-db-instance \
+              --db-instance-identifier $DB_INSTANCE \
+              --skip-final-snapshot \
+              --delete-automated-backups 2>/dev/null || true
+            
+            echo "=== RDS 삭제 대기 (최대 10분) ==="
+            for i in {1..20}; do
+              if ! aws rds describe-db-instances --db-instance-identifier $DB_INSTANCE > /dev/null 2>&1; then
+                echo "✅ RDS 삭제 완료"
+                break
+              fi
+              echo "대기 중... ($i/20)"
+              sleep 30
+            done
+          else
+            echo "ℹ️ RDS 없음"
+          fi
+
+      # ========================================================================
+      # EC2 인스턴스 삭제
+      # ========================================================================
+      - name: Delete EC2 Instances
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== EC2 인스턴스 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' --output text 2>/dev/null || true)
+          
+          if [ -n "$INSTANCES" ] && [ "$INSTANCES" != "None" ]; then
+            echo "Terminating instances: $INSTANCES"
+            aws ec2 terminate-instances --instance-ids $INSTANCES 2>/dev/null || true
+            
+            echo "=== EC2 종료 대기 (90초) ==="
+            sleep 90
+          else
+            echo "ℹ️ EC2 인스턴스 없음"
+          fi
+
+      # ========================================================================
+      # NAT Gateway 삭제
+      # ========================================================================
+      - name: Delete NAT Gateways
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== NAT Gateway 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          NAT_IDS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null || true)
+          
+          for NAT in $NAT_IDS; do
+            echo "Deleting NAT Gateway: $NAT"
+            aws ec2 delete-nat-gateway --nat-gateway-id $NAT 2>/dev/null || true
+          done
+          
+          if [ -n "$NAT_IDS" ] && [ "$NAT_IDS" != "None" ]; then
+            echo "=== NAT Gateway 삭제 대기 (120초) ==="
+            sleep 120
+          fi
+
+      # ========================================================================
+      # Elastic IP 해제
+      # ========================================================================
+      - name: Release Elastic IPs
+        run: |
+          echo "=== Elastic IP 해제 ==="
+          EIPS=$(aws ec2 describe-addresses \
+            --query 'Addresses[?AssociationId==`null`].AllocationId' --output text 2>/dev/null || true)
+          
+          for EIP in $EIPS; do
+            echo "Releasing EIP: $EIP"
+            aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # ENI 삭제
+      # ========================================================================
+      - name: Delete Network Interfaces
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== ENI 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          ENIS=$(aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=status,Values=available" \
+            --query 'NetworkInterfaces[*].NetworkInterfaceId' --output text 2>/dev/null || true)
+          
+          for ENI in $ENIS; do
+            echo "Deleting ENI: $ENI"
+            aws ec2 delete-network-interface --network-interface-id $ENI 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # Security Group 삭제
+      # ========================================================================
+      - name: Delete Security Groups
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== Security Group 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          SGS=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
+          
+          # 규칙 먼저 제거
+          for SG in $SGS; do
+            aws ec2 describe-security-groups --group-ids $SG --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null | \
+              jq -c '.[]?' | while read -r rule; do
+                aws ec2 revoke-security-group-ingress --group-id $SG --ip-permissions "$rule" 2>/dev/null || true
+              done
+            aws ec2 describe-security-groups --group-ids $SG --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null | \
+              jq -c '.[]?' | while read -r rule; do
+                aws ec2 revoke-security-group-egress --group-id $SG --ip-permissions "$rule" 2>/dev/null || true
+              done
+          done
+          
+          # SG 삭제
+          for SG in $SGS; do
+            echo "Deleting SG: $SG"
+            aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # RDS Subnet Group 삭제
+      # ========================================================================
+      - name: Delete RDS Subnet Groups
+        run: |
+          echo "=== RDS Subnet Group 삭제 ==="
+          SUBNET_GROUPS=$(aws rds describe-db-subnet-groups \
+            --query 'DBSubnetGroups[?contains(DBSubnetGroupName, `petclinic`)].DBSubnetGroupName' \
+            --output text 2>/dev/null || true)
+          
+          for SG in $SUBNET_GROUPS; do
+            echo "Deleting RDS Subnet Group: $SG"
+            aws rds delete-db-subnet-group --db-subnet-group-name $SG 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # Route Table 삭제
+      # ========================================================================
+      - name: Delete Route Tables
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== Route Table 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          RTS=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null || true)
+          
+          for RT in $RTS; do
+            ASSOCS=$(aws ec2 describe-route-tables --route-table-ids $RT \
+              --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text 2>/dev/null || true)
+            for ASSOC in $ASSOCS; do
+              aws ec2 disassociate-route-table --association-id $ASSOC 2>/dev/null || true
+            done
+            echo "Deleting Route Table: $RT"
+            aws ec2 delete-route-table --route-table-id $RT 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # Subnet 삭제
+      # ========================================================================
+      - name: Delete Subnets
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== Subnet 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' --output text 2>/dev/null || true)
+          
+          for SUBNET in $SUBNETS; do
+            echo "Deleting Subnet: $SUBNET"
+            aws ec2 delete-subnet --subnet-id $SUBNET 2>/dev/null || true
+          done
+
+      # ========================================================================
+      # Internet Gateway 삭제
+      # ========================================================================
+      - name: Delete Internet Gateway
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== Internet Gateway 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          IGW=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || true)
+          
+          if [ -n "$IGW" ] && [ "$IGW" != "None" ]; then
+            echo "Detaching IGW: $IGW"
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID 2>/dev/null || true
+            echo "Deleting IGW: $IGW"
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW 2>/dev/null || true
+          fi
+
+      # ========================================================================
+      # VPC 삭제
+      # ========================================================================
+      - name: Delete VPC
+        if: steps.get-vpc.outputs.vpc_id != 'None'
+        run: |
+          echo "=== VPC 삭제 ==="
+          VPC_ID="${{ steps.get-vpc.outputs.vpc_id }}"
+          
+          echo "Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID 2>/dev/null || true
+
+      - name: AWS Cleanup Summary
+        run: |
+          echo "✅ AWS 리소스 정리 완료!"
+
+  # ============================================================================
+  # Terraform State 정리
   # ============================================================================
   destroy:
-    name: 'Terraform Destroy'
-    needs: pre-cleanup
+    name: 'Terraform State Cleanup'
+    needs: aws-cleanup
     runs-on: ubuntu-latest
     env:
       TERRAGRUNT_IGNORE_DEPENDENCY_ERRORS: "true"
@@ -469,17 +847,19 @@ jobs:
           chmod +x terragrunt_linux_amd64
           sudo mv terragrunt_linux_amd64 /usr/local/bin/terragrunt
 
-      # ========================================================================
-      # 삭제 순서: Bootstrap → Compute → Foundation (역순)
-      # ========================================================================
+      - name: Create SSH Key
+        run: |
+          mkdir -p keys
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
+
       - name: Destroy Bootstrap
         if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'bootstrap'
         working-directory: ./bootstrap
         env:
           TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
         run: |
-          echo "=== Bootstrap Layer 삭제 ==="
-          terragrunt destroy -auto-approve -refresh=false --terragrunt-non-interactive 2>/dev/null || true
+          echo "=== Bootstrap Layer State 정리 ==="
+          terragrunt destroy -auto-approve --terragrunt-non-interactive 2>/dev/null || true
 
       - name: Destroy Compute
         if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'compute'
@@ -487,8 +867,8 @@ jobs:
         env:
           TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
         run: |
-          echo "=== Compute Layer 삭제 ==="
-          terragrunt destroy -auto-approve -refresh=false --terragrunt-non-interactive || true
+          echo "=== Compute Layer State 정리 ==="
+          terragrunt destroy -auto-approve --terragrunt-non-interactive 2>/dev/null || true
 
       - name: Destroy Foundation
         if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'foundation'
@@ -496,8 +876,8 @@ jobs:
         env:
           TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
         run: |
-          echo "=== Foundation Layer 삭제 ==="
-          terragrunt destroy -auto-approve -refresh=false --terragrunt-non-interactive || true
+          echo "=== Foundation Layer State 정리 ==="
+          terragrunt destroy -auto-approve --terragrunt-non-interactive 2>/dev/null || true
 
       - name: Verify Destruction
         run: |
@@ -511,13 +891,11 @@ jobs:
           echo "VPC (petclinic 관련):"
           aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*petclinic*" --query 'Vpcs[*].VpcId' --output text || echo "None"
           echo ""
-          echo "ALB (남은 것 확인):"
-          aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text || echo "None"
+          echo "EC2 인스턴스 (petclinic 관련):"
+          aws ec2 describe-instances --filters "Name=tag:Name,Values=*petclinic*" "Name=instance-state-name,Values=running" --query 'Reservations[*].Instances[*].InstanceId' --output text || echo "None"
 
       - name: Destroy Complete
         run: |
           echo "🎉 Terraform Destroy 완료!"
           echo ""
           echo "삭제된 레이어: ${{ github.event.inputs.layer }}"
-          echo ""
-          echo "남은 리소스가 있다면 AWS 콘솔에서 수동 확인 필요"
