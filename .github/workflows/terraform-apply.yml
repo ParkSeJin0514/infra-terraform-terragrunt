@@ -71,7 +71,15 @@ jobs:
           terragrunt --version
 
       # ========================================
-      # 5. Terragrunt Apply
+      # 5. SSH Key 생성
+      # ========================================
+      - name: Create SSH Key
+        run: |
+          mkdir -p keys
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
+
+      # ========================================
+      # 6. Terragrunt Apply
       # ========================================
       - name: Terragrunt Apply
         env:

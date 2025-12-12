@@ -72,7 +72,15 @@ jobs:
           terragrunt --version
 
       # ========================================
-      # 5. Terragrunt Plan
+      # 5. ssh key
+      # ========================================
+      - name: Create SSH Key
+        run: |
+          mkdir -p keys
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
+
+      # ========================================
+      # 6. Terragrunt Plan
       # ========================================
       - name: Terragrunt Plan
         id: plan
@@ -94,7 +102,7 @@ jobs:
         continue-on-error: true
 
       # ========================================
-      # 6. PR에 코멘트
+      # 7. PR에 코멘트
       # ========================================
       - name: Comment on PR
         uses: actions/github-script@v7
