@@ -393,15 +393,17 @@ resource "aws_ec2_tag" "karpenter_node_sg_discovery" {
 # 6. Spot Instance Service-Linked Role
 # ============================================================================
 # EC2 Spot Instance를 사용하기 위한 Service-Linked Role
-# 계정당 한 번만 생성하면 됨
+# 계정당 한 번만 생성하면 됨 (이미 존재하면 생성 스킵)
 # ============================================================================
 
+# 기존 Spot SLR 존재 여부 확인
+data "aws_iam_roles" "spot_fleet_slr" {
+  name_regex = "AWSServiceRoleForEC2Spot"
+}
+
 resource "aws_iam_service_linked_role" "spot" {
+  # 이미 존재하면 생성하지 않음
+  count            = length(data.aws_iam_roles.spot_fleet_slr.names) == 0 ? 1 : 0
   aws_service_name = "spot.amazonaws.com"
   description      = "Service-linked role for EC2 Spot Instances"
-  
-  # 이미 존재하면 에러 방지
-  # lifecycle {
-  #   prevent_destroy = true
-  # }
 }
