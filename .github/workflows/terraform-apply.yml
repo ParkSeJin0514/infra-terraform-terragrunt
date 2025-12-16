@@ -1,19 +1,26 @@
 # ============================================================================
-# Terraform Apply (main 브랜치 merge 시 실행)
+# Terraform Apply
 # ============================================================================
-# main에 merge되면 자동으로 Apply 실행
+# 수동 실행으로 레이어 선택하여 Apply
+# - all: foundation → compute → bootstrap 순차 실행
+# - foundation / compute / bootstrap: 개별 레이어만 실행
 # ============================================================================
 
 name: Terraform Apply
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**.tf'
-      - '**.hcl'
-      - 'modules/**'
-      - 'README.md'
+  workflow_dispatch:
+    inputs:
+      layer:
+        description: '적용할 레이어 선택'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - foundation
+          - compute
+          - bootstrap
 
 env:
   AWS_REGION: ap-northeast-2
@@ -27,7 +34,7 @@ concurrency:
 
 jobs:
   apply:
-    name: Terraform Apply
+    name: Terraform Apply (${{ github.event.inputs.layer }})
     runs-on: ubuntu-latest
     
     # OIDC 토큰 발급 권한
@@ -79,12 +86,47 @@ jobs:
           echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
 
       # ========================================
-      # 6. Terragrunt Apply
+      # 6. Apply Foundation
       # ========================================
-      - name: Terragrunt Apply
+      - name: Apply Foundation
+        if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'foundation'
         env:
           TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
         run: |
+          echo "🏗️ Foundation Layer Apply 시작..."
           cd foundation && terragrunt apply --terragrunt-non-interactive -auto-approve
-          cd ../compute && terragrunt apply --terragrunt-non-interactive -auto-approve
-          cd ../bootstrap && terragrunt apply --terragrunt-non-interactive -auto-approve
+          echo "✅ Foundation Layer 완료"
+
+      # ========================================
+      # 7. Apply Compute
+      # ========================================
+      - name: Apply Compute
+        if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'compute'
+        env:
+          TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
+        run: |
+          echo "🖥️ Compute Layer Apply 시작..."
+          cd compute && terragrunt apply --terragrunt-non-interactive -auto-approve
+          echo "✅ Compute Layer 완료"
+
+      # ========================================
+      # 8. Apply Bootstrap
+      # ========================================
+      - name: Apply Bootstrap
+        if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'bootstrap'
+        env:
+          TF_VAR_db_password: ${{ secrets.TF_VAR_db_password }}
+        run: |
+          echo "🚀 Bootstrap Layer Apply 시작..."
+          cd bootstrap && terragrunt apply --terragrunt-non-interactive -auto-approve
+          echo "✅ Bootstrap Layer 완료"
+
+      # ========================================
+      # 9. 완료 메시지
+      # ========================================
+      - name: Apply Complete
+        run: |
+          echo "=============================================="
+          echo "🎉 Terraform Apply 완료!"
+          echo "=============================================="
+          echo "적용된 레이어: ${{ github.event.inputs.layer }}"

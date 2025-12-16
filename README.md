@@ -51,9 +51,8 @@ AWS EKS 인프라를 위한 Terragrunt 기반 IaC 프로젝트
 ├── github-oidc/        # GitHub Actions OIDC 설정
 ├── keys/               # SSH Key Pair (.gitignore)
 └── .github/workflows/  # CI/CD 워크플로우
-    ├── terraform-apply.yml     # Plan & Apply
-    ├── terraform-plan.yml      # PR Plan
-    └── terraform-all-destroy.yml # Destroy (Karpenter 정리 포함)
+    ├── terraform-apply.yml     # Apply (레이어 선택 가능)
+    └── terraform-destroy.yml   # Destroy (Karpenter 정리 포함)
 ```
 
 ## 🚀 사용법
@@ -103,15 +102,29 @@ gitops_repo_url = "https://github.com/YOUR_ORG/platform-gitops.git"
 
 | 워크플로우 | 트리거 | 동작 |
 |-----------|--------|------|
-| `terraform-plan.yml` | PR | Plan 실행 |
-| `terraform-apply.yml` | Push to main | Apply 실행 |
-| `terraform-all-destroy.yml` | 수동 (workflow_dispatch) | Pre-cleanup → Destroy |
+| `terraform-apply.yml` | 수동 (workflow_dispatch) | 레이어 선택하여 Apply |
+| `terraform-destroy.yml` | 수동 (workflow_dispatch) | Pre-cleanup → Destroy |
 
 ### 🔧 설정 방법
 
 1. `github-oidc/` 실행하여 OIDC Role 생성
-2. GitHub Secrets 등록: `AWS_ROLE_ARN`, `TF_VAR_db_password`
-3. PR 생성 시 자동 Plan, Merge 시 자동 Apply
+2. GitHub Secrets 등록: `AWS_ROLE_ARN`, `TF_VAR_db_password`, `SSH_PUBLIC_KEY`
+3. Actions 탭에서 수동 실행
+
+### 🚀 Apply 워크플로우
+
+```
+GitHub Actions → Run workflow → layer 선택
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Layer 옵션                                                       │
+├─────────────────────────────────────────────────────────────────┤
+│ • all        : foundation → compute → bootstrap 순차 실행       │
+│ • foundation : VPC, Subnets, NAT Gateway                        │
+│ • compute    : EKS, RDS, EC2, Karpenter IAM                     │
+│ • bootstrap  : ArgoCD                                           │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### 🗑️ Destroy 워크플로우 (개선됨)
 
@@ -267,5 +280,3 @@ aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 | **platform-gitops** | GitOps 매니페스트 (Karpenter, ArgoCD Apps) |
 | **petclinic-gitops** | PetClinic 애플리케이션 GitOps |
 | **petclinic-dev** | PetClinic 소스 코드 + CI/CD |
-
-#test
